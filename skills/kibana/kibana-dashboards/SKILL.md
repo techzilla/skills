@@ -83,7 +83,15 @@ Only for 9.5+ or Serverless, when Step 0 selected it.
    A standalone visualization body is the panel's `config` object alone. For other chart types read
    [Chart Types](references/chart-types-reference.md), [Lens API](references/lens-api-reference.md), and
    [Dashboard API](references/dashboard-api-reference.md); examples are in [assets/](assets/).
-4. **Execute, then confirm** with `get-dashboard` / `get-visualization`. Report id and title; never claim success
+4. **Back up, execute, confirm.** Before upserting an existing dashboard, save a backup (restore it with
+   `post-saved-objects-import --file backup.ndjson --overwrite`):
+
+   ```sh
+   elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<id>"}]' \
+     --exclude-export-details | jq -c '.[] | select(.type)' > backup.ndjson
+   ```
+
+   Then run the write and confirm with `get-dashboard` / `get-visualization`. Report id and title; never claim success
    without a successful read-back.
 
 **Search:** `--query` is `simple_query_string` on title and description; all words must match.
@@ -117,7 +125,8 @@ elastic kb dashboards search-dashboards --input-file q.json --no-validate
 
 ## Saved objects route
 
-When Step 0 selected it. Never use `elastic kb dashboards` / `visualizations` commands on this route. Filter paths
+When Step 0 selected it. Never use `elastic kb dashboards` / `visualizations` commands on this route, except the
+delete commands on Serverless (see Rules). Filter paths
 (`jq/*.jq`) are relative to this skill's directory. Verified against Kibana 9.3–9.5 source.
 
 **Model.** A dashboard is a `dashboard` saved object. Its panels are a JSON string in `attributes.panelsJSON`; each
@@ -147,9 +156,12 @@ elastic kb saved-objects post-saved-objects-export --type dashboard --search '<q
 # Search by tag id
 elastic kb saved-objects post-saved-objects-export --type dashboard --has-reference '{"type":"tag","id":"<tag-id>"}' \
   --exclude-export-details | jq -c -f jq/list.jq
-# Get one dashboard (summary.jq), or list its charts (charts.jq; by-value charts have no library_id)
+# Get one dashboard: panels and references
 elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' \
   --exclude-export-details | jq -f jq/summary.jq
+# List a dashboard's charts with their ES|QL; by-value charts have no library_id
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' \
+  --exclude-export-details | jq -c -f jq/charts.jq
 ```
 
 **Edit** — every edit is export → filter → import:
@@ -222,7 +234,7 @@ Reference lines: compute them in the query (`| EVAL goal = 15000`) and reference
 | Symptom                                 | Fix                                                                         |
 | --------------------------------------- | --------------------------------------------------------------------------- |
 | `dashboards` / `visualizations` missing | Stack < 9.5: use the [saved objects route](#saved-objects-route)            |
-| Panels gone after `upsert-dashboard`    | Restore from a saved-objects export; edit via the saved objects route       |
+| Panels gone after `upsert-dashboard`    | Import `backup.ndjson` with `--overwrite`; edit via the saved objects route |
 | API tag filter returns nothing          | String tag via `--input-file` with `--no-validate`                          |
 | `must be array` validation error        | Add `--no-validate`                                                         |
 | `Pass --yes to confirm`                 | Add `--yes`                                                                 |
