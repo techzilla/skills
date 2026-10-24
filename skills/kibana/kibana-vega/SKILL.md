@@ -35,76 +35,55 @@ Connection comes from the [`elastic` CLI](https://github.com/elastic/cli#configu
 then stop. Do not guess credentials or call the HTTP API directly. For a non-default space, use a context whose
 `kibana.url` ends in `/s/<space-id>` and select it with `--use-context <name>`.
 
+Filter paths (`jq/*.jq`) are relative to this skill's directory.
+
 ### Visualizations
 
-**Create or update** (same command; `--overwrite` replaces an existing id). Choose a stable, unique `id`.
+**Create or update** (same command; `--overwrite` replaces an existing id). Choose a stable, unique `id`. `jq` fails on
+invalid JSON in `spec.json`; fix the spec rather than bypassing the check.
 
 ```bash
-jq -nc --arg id '<vis-id>' --arg title '<title>' --rawfile spec spec.json \
-  '($spec|fromjson) as $_ | {type:"visualization", id:$id, attributes:{title:$title, description:"",
-   visState:({title:$title, type:"vega", params:{spec:$spec}, aggs:[]}|tojson), uiStateJSON:"{}",
-   kibanaSavedObjectMeta:{searchSourceJSON:"{}"}}, references:[]}' > vis.ndjson
+jq -nc --arg id '<vis-id>' --arg title '<title>' --rawfile spec spec.json -f jq/new-vis.jq > vis.ndjson && \
 elastic kb saved-objects post-saved-objects-import --file vis.ndjson --overwrite
 ```
 
-`jq` fails on invalid JSON in `spec.json`; fix the spec rather than bypassing the check.
-
-**Get spec** for review or modification:
+**Get spec** for review or modification, and **search** (`--search` is `simple_query_string` on titles):
 
 ```bash
 elastic kb saved-objects post-saved-objects-export --objects '[{"type":"visualization","id":"<vis-id>"}]' \
-  --exclude-export-details | jq -r '.[] | select(.type=="visualization") | .attributes.visState | fromjson | .params.spec' > spec.json
-```
-
-**Search** (`--search` uses `simple_query_string` on titles):
-
-```bash
+  --exclude-export-details | jq -r -f jq/spec.jq > spec.json
 elastic kb saved-objects post-saved-objects-export --type visualization --search '<query>' --exclude-export-details \
-  | jq -c '.[] | select(.type=="visualization" and (.attributes.visState | fromjson | .type) == "vega") | {id, title: .attributes.title}'
+  | jq -c -f jq/list-vega.jq
 ```
 
 ### Dashboards
 
-**Create** an empty dashboard:
+**Create** an empty dashboard, and **search** dashboards:
 
 ```bash
-jq -nc --arg id '<dash-id>' --arg title '<title>' '{type:"dashboard", id:$id, attributes:{title:$title, description:"",
-  panelsJSON:"[]", optionsJSON:({useMargins:true, syncColors:true, syncTooltips:true, syncCursor:true}|tojson),
-  timeRestore:false, kibanaSavedObjectMeta:{searchSourceJSON:"{}"}}, references:[]}' > dash.ndjson
+jq -nc --arg id '<dash-id>' --arg title '<title>' -f jq/new-dashboard.jq > dash.ndjson && \
+elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
+elastic kb saved-objects post-saved-objects-export --type dashboard --search '<query>' --exclude-export-details \
+  | jq -c -f jq/list.jq
+```
+
+**Edit** — export → filter → import, with `<filter>` and `<args>` from the table:
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' \
+  --exclude-export-details | jq -c <args> -f jq/<filter>.jq > dash.ndjson && \
 elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
 ```
 
-**Search** dashboards: `post-saved-objects-export --type dashboard --search '<query>' --exclude-export-details`, then
-`jq -c '.[] | select(.type=="dashboard") | {id, title: .attributes.title}'`.
+| Change         | `<filter>`     | `<args>`                                                                              |
+| -------------- | -------------- | ------------------------------------------------------------------------------------- |
+| Add a panel    | `add-panel`    | `--arg vis '<vis-id>' --arg panel '<panel-id>' [--argjson grid '{"w":24,"h":10}']`    |
+| Apply a layout | `apply-layout` | `--slurpfile layout layout.json`                                                      |
 
-**Add a panel.** `$g` sets any of `x`, `y`, `w`, `h`; omitted values default to `x:0, w:48, h:15` and `y` below the
-lowest panel. `<panel-id>` must be unique within the dashboard.
-
-```bash
-elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
-  | jq -c --arg vis '<vis-id>' --arg p '<panel-id>' --argjson g '{"x":0,"y":0,"w":24,"h":10}' '.[] | select(.type=="dashboard")
-    | (.attributes.panelsJSON | fromjson) as $P
-    | ({x:0, w:48, h:15, y:([$P[].gridData | .y + .h] | max // 0)} + $g + {i:$p}) as $G
-    | .attributes.panelsJSON = ($P + [{type:"visualization", panelIndex:$p, panelRefName:"panel_\($p)", gridData:$G,
-        embeddableConfig:{hidePanelTitles:true}}] | tojson)
-    | .references += [{type:"visualization", id:$vis, name:"panel_\($p)"}]' > dash.ndjson
-elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
-```
-
-**Apply a layout.** Replaces all panels and panel references; keeps other attributes and non-panel references (tags).
-`title` is optional.
-
-```bash
-elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
-  | jq -c --slurpfile l layout.json '$l[0] as $L | .[] | select(.type=="dashboard")
-    | .attributes.title = ($L.title // .attributes.title)
-    | .attributes.panelsJSON = ([$L.panels | to_entries[] | {type:"visualization", panelIndex:"p\(.key)",
-        panelRefName:"panel_p\(.key)", gridData:{x:.value.x, y:.value.y, w:.value.w, h:.value.h, i:"p\(.key)"},
-        embeddableConfig:{hidePanelTitles:true}}] | tojson)
-    | .references = ([.references[] | select(.name | contains("panel_") | not)]
-        + [$L.panels | to_entries[] | {type:"visualization", id:.value.visualization, name:"panel_p\(.key)"}])' > dash.ndjson
-elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
-```
+- `add-panel`: `grid` sets any of `x`, `y`, `w`, `h`; defaults are `x:0, w:48, h:15`, below the lowest panel.
+  `<panel-id>` must be unique within the dashboard.
+- `apply-layout`: replaces all panels and their references with `layout.json`'s; keeps other attributes and non-panel
+  references (tags). Its `title` is optional.
 
 **Never** edit a dashboard containing Vega panels with `elastic kb dashboards upsert-dashboard`: the Dashboards API
 drops unsupported panels, so the write deletes them.
@@ -269,7 +248,7 @@ Management > Saved Objects**.
 | Labels show "undefined"                | Rename dotted fields: `RENAME room.name AS room`                                                     |
 | Bars invisible / not rendering         | Remove complex `scale.domain`, use simpler color schemes                                             |
 | Y-axis labels truncated                | Add `axis: { "labelLimit": 150 }` to encoding                                                        |
-| Panels stacked vertically              | Set `x`/`y`/`w`/`h` in `$g` or `layout.json`                                                         |
+| Panels stacked vertically              | Set `x`/`y`/`w`/`h` via `grid` or `layout.json`                                                      |
 | "width/height ignored"                 | Remove dimensions, use `autosize`                                                                    |
 | Bright white borders on dark theme     | Add `config: { "view": { "stroke": null }, "axis": { "domainColor": "#444", "tickColor": "#444" } }` |
 | "401 Unauthorized"                     | Check the CLI context's `kibana.auth`                                                                |
