@@ -1,0 +1,1 @@
+{"type":"dashboard","id":"new-dash","references":[],"attributes":{"title":"New","description":"","panelsJSON":"[]","optionsJSON":"{\"useMargins\":true,\"syncColors\":true,\"syncTooltips\":true,\"syncCursor\":true}","timeRestore":true,"kibanaSavedObjectMeta":{"searchSourceJSON":"{}"},"timeFrom":"now-7d","timeTo":"now"}}
