@@ -1,0 +1,25 @@
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+  "title": "Top 10 Services by Error Count",
+  "data": {
+    "url": {
+      "%type%": "esql",
+      "%context%": true,
+      "%timefield%": "@timestamp",
+      "query": "FROM logs-* | WHERE @timestamp >= ?_tstart AND @timestamp <= ?_tend | WHERE log.level == \"error\" | STATS error_count = COUNT() BY service.name | RENAME service.name AS service | SORT error_count DESC | LIMIT 10"
+    }
+  },
+  "mark": { "type": "bar", "color": "#6092C0" },
+  "encoding": {
+    "y": { "field": "service", "type": "nominal", "sort": null, "axis": { "title": null, "labelLimit": 150 } },
+    "x": { "field": "error_count", "type": "quantitative", "axis": { "title": null } },
+    "tooltip": [
+      { "field": "service", "type": "nominal", "title": "Service" },
+      { "field": "error_count", "type": "quantitative", "title": "Errors" }
+    ]
+  },
+  "config": {
+    "axis": { "domainColor": "#444", "tickColor": "#444" },
+    "view": { "stroke": null }
+  }
+}
