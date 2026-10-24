@@ -62,8 +62,9 @@ reported there as `dropped_panel` and unmapped keys are stripped on read, so wri
 ## Process
 
 1. **Verify Kibana connectivity.** Call `GET kbn:/api/status`. If the call fails, stop and surface the error. Read
-   `version.number` and `version.build_flavor`, then pick the route per [Choosing an API](#choosing-an-api). Steps 3–6
-   apply to the Dashboards/Visualizations API.
+   `version.number` and `version.build_flavor`, then pick the route per [Choosing an API](#choosing-an-api). **Stack
+   below 9.5:** stop here and follow the [Saved objects route](#saved-objects-route) instead of steps 2–7, which use
+   the Dashboards/Visualizations API.
 
 2. **Classify the task.** Decide whether the user needs a **dashboard** (collection of panels, optional time range), a
    **standalone Lens visualization** (library item referenced by id or used alone), or **both**. Determine whether a
@@ -151,10 +152,9 @@ reported there as `dropped_panel` and unmapped keys are stripped on read, so wri
    `GET kbn:/api/visualizations/{id}`. Report the id and title back to the user — do not claim success without a
    successful read-back.
 
-7. **Search, export, or delete when requested.** Find objects per [Searching](#searching) or the
-   [Saved objects route](#saved-objects-route) — filter server-side; do not list everything and scan. Delete with
-   `DELETE kbn:/api/dashboards/{id}` or `DELETE kbn:/api/visualizations/{id}`. For bulk export or import, use
-   `POST kbn:/api/saved_objects/_export` or `POST kbn:/api/saved_objects/_import`.
+7. **Search, export, or delete when requested.** Find objects per [Searching](#searching) — filter server-side; do not
+   list everything and scan. Delete with `DELETE kbn:/api/dashboards/{id}` or `DELETE kbn:/api/visualizations/{id}`.
+   For bulk export, import, or copying between clusters, use the [Saved objects route](#saved-objects-route).
 
 ## Searching
 
@@ -185,16 +185,27 @@ elastic kb saved-objects post-saved-objects-export --type tag --search '<tag-nam
 
 ## Saved objects route
 
-Works on any 9.x and preserves panels the Dashboards API cannot. Dashboards are `dashboard` saved objects: panels live
-in the `panelsJSON` string attribute, and each by-reference panel's library object is a reference named
-`<panelIndex>:savedObjectRef`. Lens visualizations are `lens` objects; legacy and Vega visualizations are
-`visualization`.
+Verified against Kibana 9.3–9.5 source; preserves panels the Dashboards API cannot. Dashboards are `dashboard` saved
+objects: panels live in the `panelsJSON` string attribute, each with a `type`, `panelIndex`, `gridData`, and
+`embeddableConfig`. Each panel's references are named `<panelIndex>:<name>`.
+
+**Chart panels** are `type: "vis"` (Kibana 9.4+; panels saved earlier keep `lens`). Legacy and Vega visualizations are
+`legacy_vis` (earlier: `visualization`), saved searches `discover_session` (earlier: `search`). A chart is:
+
+- **By reference** — a reference `<panelIndex>:savedObjectRef` to a library object (`lens`, or `visualization` for
+  legacy/Vega). Search finds these with `--type lens`.
+- **By value** — the full Lens state is stored in the panel's `embeddableConfig.attributes`; there is no library object,
+  so only reading the dashboard finds it. An ES|QL chart keeps its query in `attributes.state.query.esql` and in each
+  `attributes.state.datasourceStates.textBased.layers.*.query.esql`.
+
+Rules:
 
 - Import with `--overwrite` replaces the whole object and has no concurrency check: always export immediately before
   editing.
 - Create without `--overwrite`; an existing id is reported as a conflict instead of overwritten.
-- Lens saved-object state is internal and version-specific: do not hand-author it. Copy an existing visualization, build
-  it in the UI, or use the `kibana-vega` skill, then add it as a panel.
+- Lens state is internal and version-specific: do not hand-author it from scratch. For a new ES|QL chart on Kibana
+  < 9.5, [copy an existing ES|QL chart with a new query](#new-esql-chart-from-an-existing-one), build it in the UI, or
+  use the `kibana-vega` skill (ES|QL Vega charts), then add it as a panel.
 - Delete via saved objects is stack only; on Serverless use `delete-dashboard` / `delete-visualization`.
 
 **Search** by title (`simple_query_string`), or by tag id:
@@ -216,12 +227,44 @@ elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboar
     panels: (.attributes.panelsJSON | fromjson | map({panelIndex, type, gridData})), references}'
 ```
 
+**List charts** in a dashboard (by-value charts have no `library_id`):
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
+  | jq -c '.[] | select(.type=="dashboard") | .references as $R | .attributes.panelsJSON | fromjson[]
+    | select(.type == "vis" or .type == "lens") | .panelIndex as $i
+    | {panelIndex, title: (.embeddableConfig.title // .embeddableConfig.attributes.title),
+       library_id: ([$R[] | select(.name == "\($i):savedObjectRef") | .id][0]),
+       esql: .embeddableConfig.attributes.state.query.esql}'
+```
+
+#### New ES|QL chart from an existing one
+
+Copies a by-value ES|QL chart panel with a new title and query, placed below the existing panels. The new query must
+keep the same `FROM` source and output column names as the original: Lens binds each layer's `columns[].fieldName` to
+them. Otherwise build the chart in the UI or with `kibana-vega`.
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
+  | jq -c --arg src '<source-panel-id>' --arg p '<new-panel-id>' --arg title '<title>' --arg q '<esql>' \
+  '.[] | select(.type=="dashboard") | (.attributes.panelsJSON | fromjson) as $P
+    | ($P[] | select(.panelIndex == $src)) as $s
+    | if $s.embeddableConfig.attributes.state.datasourceStates.textBased then . else error("not a by-value ES|QL chart") end
+    | ([$P[] | select(.gridData.sectionId == null) | .gridData | .y + .h] | max // 0) as $y
+    | ($s | .panelIndex = $p | .gridData += {x:0, y:$y, i:$p} | .embeddableConfig.title = $title
+        | .embeddableConfig.attributes.title = $title | .embeddableConfig.attributes.state.query.esql = $q
+        | .embeddableConfig.attributes.state.datasourceStates.textBased.layers |= map_values(.query.esql = $q)) as $n
+    | .attributes.panelsJSON = ($P + [$n] | tojson)
+    | .references += [.references[] | select(.name | startswith("\($src):")) | .name |= "\($p):" + ltrimstr("\($src):")]' > dash.ndjson && \
+elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
+```
+
 **Create** an empty dashboard (omit `timeFrom`/`timeTo` and set `timeRestore:false` for no default time range):
 
 ```bash
 jq -nc --arg id '<dash-id>' --arg title '<title>' '{type:"dashboard", id:$id, attributes:{title:$title, description:"",
   panelsJSON:"[]", optionsJSON:({useMargins:true, syncColors:true, syncTooltips:true, syncCursor:true}|tojson),
-  timeRestore:true, timeFrom:"now-7d", timeTo:"now", kibanaSavedObjectMeta:{searchSourceJSON:"{}"}}, references:[]}' > dash.ndjson
+  timeRestore:true, timeFrom:"now-7d", timeTo:"now", kibanaSavedObjectMeta:{searchSourceJSON:"{}"}}, references:[]}' > dash.ndjson && \
 elastic kb saved-objects post-saved-objects-import --file dash.ndjson
 ```
 
@@ -229,7 +272,7 @@ elastic kb saved-objects post-saved-objects-import --file dash.ndjson
 
 ```bash
 elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
-  | jq -c '.[] | select(.type=="dashboard") | <filter>' > dash.ndjson
+  | jq -c '.[] | select(.type=="dashboard") | <filter>' > dash.ndjson && \
 elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
 ```
 
@@ -250,8 +293,9 @@ elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrit
   | map(if $g[.panelIndex] then .gridData += $g[.panelIndex] else . end) | tojson)
 ```
 
-**Add a library panel** (`lens`, `visualization`, `links`, `search`, or `map` by reference). `$g` overrides any of `x`,
-`y`, `w`, `h`; `y` defaults to below the lowest top-level panel. `<panel-id>` must be unique in the dashboard.
+**Add a library panel** by reference. `$t` is the library object's saved-object type (`lens`, `visualization`,
+`links`, `search`, or `map`); Kibana maps it to the current panel type on read. `$g` overrides any of `x`, `y`, `w`, `h`;
+`y` defaults to below the lowest top-level panel. `<panel-id>` must be unique in the dashboard.
 
 ```bash
 elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
@@ -259,7 +303,7 @@ elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboar
     --argjson g '{"w":24,"h":15}' '.[] | select(.type=="dashboard") | (.attributes.panelsJSON | fromjson) as $P
     | ({x:0, w:24, h:15, y:([$P[] | select(.gridData.sectionId == null) | .gridData | .y + .h] | max // 0)} + $g + {i:$p}) as $G
     | .attributes.panelsJSON = ($P + [{type:$t, panelIndex:$p, gridData:$G, embeddableConfig:{}}] | tojson)
-    | .references += [{type:$t, id:$ref, name:"\($p):savedObjectRef"}]' > dash.ndjson
+    | .references += [{type:$t, id:$ref, name:"\($p):savedObjectRef"}]' > dash.ndjson && \
 elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
 ```
 
@@ -270,7 +314,7 @@ elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboar
   | jq -c --arg p '<panel-id>' '.[] | select(.type=="dashboard") | (.attributes.panelsJSON | fromjson) as $P
     | ([$P[] | select(.panelIndex == $p) | .panelRefName // empty]) as $legacy
     | .attributes.panelsJSON = ($P | map(select(.panelIndex != $p)) | tojson)
-    | .references |= map(select((.name | startswith("\($p):")) or (.name | IN($legacy[])) | not))' > dash.ndjson
+    | .references |= map(select((.name | startswith("\($p):")) or (.name | IN($legacy[])) | not))' > dash.ndjson && \
 elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
 ```
 
@@ -278,7 +322,7 @@ elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrit
 
 ```bash
 elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' \
-  --include-references-deep --exclude-export-details | jq -c '.[] | select(.type)' > bundle.ndjson
+  --include-references-deep --exclude-export-details | jq -c '.[] | select(.type)' > bundle.ndjson && \
 elastic --use-context '<target-context>' kb saved-objects post-saved-objects-import --file bundle.ndjson --overwrite
 ```
 
@@ -286,7 +330,7 @@ elastic --use-context '<target-context>' kb saved-objects post-saved-objects-imp
 
 ```bash
 elastic kb saved-objects post-saved-objects-export --objects '[{"type":"lens","id":"<vis-id>"}]' --exclude-export-details \
-  | jq -c --arg id '<new-id>' --arg title '<new-title>' '.[] | select(.type=="lens") | .id = $id | .attributes.title = $title' > vis.ndjson
+  | jq -c --arg id '<new-id>' --arg title '<new-title>' '.[] | select(.type=="lens") | .id = $id | .attributes.title = $title' > vis.ndjson && \
 elastic kb saved-objects post-saved-objects-import --file vis.ndjson
 ```
 
