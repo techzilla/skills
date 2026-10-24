@@ -6,19 +6,20 @@ description: >
   them, or automate their deployment.
 metadata:
   author: techzilla
-  version: 0.4.0
+  version: 0.5.0
   universal: true
   derived_from: elastic/agent-skills v0.6.0 (Apache-2.0), modified
-compatibility: Kibana 9.4 or later (Dashboards and Visualizations APIs) with matching
-  Elasticsearch, self-managed, Elastic Cloud Hosted, or Elastic Cloud Serverless.
-  Written for and verified against `elastic` CLI 0.7.0.
+compatibility: Kibana 9.x stack (self-managed or Elastic Cloud Hosted) or Elastic Cloud Serverless. Dashboards and
+  Visualizations API commands need Kibana 9.5+ or Serverless; saved-objects procedures work on any 9.x. Written for and
+  verified against `elastic` CLI 0.7.0. Saved-objects procedures require `jq`.
 ---
 
 # Kibana Dashboards and Lens Visualizations
 
-Search, create, update, and delete Kibana dashboards and standalone Lens visualizations using the Kibana 9.4+ Dashboards
-and Visualizations APIs. Produce minimal, diffable JSON bodies; prefer inline panel definitions over library references;
-and choose the correct dataset type (data view vs ES|QL) before writing metrics or chart layers.
+Search, create, update, and delete Kibana dashboards and standalone Lens visualizations using the Kibana 9.5+ Dashboards
+and Visualizations APIs, or the saved objects API where those can't be used. Produce minimal, diffable JSON bodies;
+prefer inline panel definitions over library references; and choose the correct dataset type (data view vs ES|QL)
+before writing metrics or chart layers.
 
 ## Environment Configuration
 
@@ -29,23 +30,23 @@ not guess credentials or call the HTTP API directly; use only the workarounds do
 Operations are written in HTTP-shorthand form (e.g., `GET kbn:/api/dashboards`). The [Operations](#operations) table maps
 each to its CLI command. Commands taking `--input-file` read a JSON object of the request's query/body fields.
 
-## Version gate (Kibana < 9.5)
+## Choosing an API
 
-CLI 0.7.0 marks every `elastic kb dashboards` and `elastic kb visualizations` command as Kibana 9.5+ and hides them when
-the context's detected Kibana version is older. On 9.4 these APIs exist (technical preview) but the commands are
-absent from `--help` and fail as unknown.
+| Kibana              | `elastic kb dashboards` / `visualizations`                          | Use                                        |
+| ------------------- | ------------------------------------------------------------------- | ------------------------------------------ |
+| 9.5+ or Serverless  | Available                                                           | Dashboards/Visualizations API              |
+| 9.4                 | Hidden by CLI 0.7.0 (the API exists only as a technical preview)    | [Saved objects route](#saved-objects-route) |
+| < 9.4               | API does not exist                                                  | [Saved objects route](#saved-objects-route) |
 
-- **Workaround (preferred):** ask the user to pin the version in the context's `kibana` block of the CLI config, then
-  retry. Do not edit the config without approval.
+Never pin a false `version` in the CLI config to unhide commands.
 
-  ```yaml
-  kibana:
-    version: "9.5"
-  ```
+**Also use the saved objects route on 9.5+** to modify a dashboard the Dashboards API cannot round-trip. Never
+`upsert-dashboard` a dashboard whose `get-dashboard` response has a top-level `warnings` array: unsupported panels are
+reported there as `dropped_panel` and unmapped keys are stripped on read, so writing it back deletes them.
 
-- **Workaround (search only, no pin):** use `get-saved-objects-find` (see [Searching](#searching)). Stack only.
-- 9.4 list responses return items under `dashboards` / `visualizations` with top-level `total`; 9.5+ uses `data` and
-  `meta`.
+- **Links panels:** the 9.4 Dashboards API has no links panel schema, so it cannot preserve them. 9.5+ supports them but
+  strips each panel's `enhancements` (drilldowns) and `disabledActions`. Edit dashboards with links panels via saved
+  objects.
 
 ## Prerequisites
 
@@ -61,7 +62,8 @@ absent from `--help` and fail as unknown.
 ## Process
 
 1. **Verify Kibana connectivity.** Call `GET kbn:/api/status`. If the call fails, stop and surface the error. Read
-   `version.number`; below 9.5, apply the [Version gate](#version-gate-kibana--95).
+   `version.number` and `version.build_flavor`, then pick the route per [Choosing an API](#choosing-an-api). Steps 3–6
+   apply to the Dashboards/Visualizations API.
 
 2. **Classify the task.** Decide whether the user needs a **dashboard** (collection of panels, optional time range), a
    **standalone Lens visualization** (library item referenced by id or used alone), or **both**. Determine whether a
@@ -149,13 +151,16 @@ absent from `--help` and fail as unknown.
    `GET kbn:/api/visualizations/{id}`. Report the id and title back to the user — do not claim success without a
    successful read-back.
 
-7. **Search, export, or delete when requested.** Find objects per [Searching](#searching) — filter server-side; do not
-   list everything and scan. Delete with `DELETE kbn:/api/dashboards/{id}` or `DELETE kbn:/api/visualizations/{id}`.
-   For bulk export or import, use `POST kbn:/api/saved_objects/_export` or `POST kbn:/api/saved_objects/_import`.
+7. **Search, export, or delete when requested.** Find objects per [Searching](#searching) or the
+   [Saved objects route](#saved-objects-route) — filter server-side; do not list everything and scan. Delete with
+   `DELETE kbn:/api/dashboards/{id}` or `DELETE kbn:/api/visualizations/{id}`. For bulk export or import, use
+   `POST kbn:/api/saved_objects/_export` or `POST kbn:/api/saved_objects/_import`.
 
 ## Searching
 
-`--query` uses `simple_query_string` against `title` and `description`; all words must match.
+Dashboards/Visualizations API (9.5+ or Serverless). On older versions, search per the
+[Saved objects route](#saved-objects-route). `--query` uses `simple_query_string` against `title` and `description`;
+all words must match.
 
 ```sh
 elastic kb dashboards search-dashboards --query 'nginx*' --per-page 50 --page 1
@@ -171,19 +176,124 @@ echo '{"query":"nginx*","tags":"<tag-id>","per_page":50}' > q.json
 elastic kb dashboards search-dashboards --input-file q.json --no-validate
 ```
 
-`tag_names` / `excluded_tag_names` require Kibana 9.6+; resolve names to ids instead:
+`tag_names` / `excluded_tag_names` require Kibana 9.6+; resolve names to ids instead (any version):
 
 ```sh
-echo '{"type":"tag","search":"<tag-name>","search_fields":"name"}' > t.json
-elastic kb saved-objects get-saved-objects-find --input-file t.json --no-validate
+elastic kb saved-objects post-saved-objects-export --type tag --search '<tag-name>' --exclude-export-details \
+  | jq -c '.[] | select(.type=="tag") | {id, name: .attributes.name}'
 ```
 
-**Saved-objects search** (works without the version pin; stack only). `--type` and `--has-reference` are mis-encoded by
-CLI 0.7.0, so always use `--input-file` with string values and `--no-validate`:
+## Saved objects route
 
-```sh
-echo '{"type":"dashboard","search":"nginx*","search_fields":"title","has_reference":"{\"type\":\"tag\",\"id\":\"<tag-id>\"}","per_page":50}' > f.json
-elastic kb saved-objects get-saved-objects-find --input-file f.json --no-validate
+Works on any 9.x and preserves panels the Dashboards API cannot. Dashboards are `dashboard` saved objects: panels live
+in the `panelsJSON` string attribute, and each by-reference panel's library object is a reference named
+`<panelIndex>:savedObjectRef`. Lens visualizations are `lens` objects; legacy and Vega visualizations are
+`visualization`.
+
+- Import with `--overwrite` replaces the whole object and has no concurrency check: always export immediately before
+  editing.
+- Create without `--overwrite`; an existing id is reported as a conflict instead of overwritten.
+- Lens saved-object state is internal and version-specific: do not hand-author it. Copy an existing visualization, build
+  it in the UI, or use the `kibana-vega` skill, then add it as a panel.
+- Delete via saved objects is stack only; on Serverless use `delete-dashboard` / `delete-visualization`.
+
+**Search** by title (`simple_query_string`), or by tag id:
+
+```bash
+elastic kb saved-objects post-saved-objects-export --type dashboard --search '<query>' --exclude-export-details \
+  | jq -c '.[] | select(.type=="dashboard") | {id, title: .attributes.title}'
+elastic kb saved-objects post-saved-objects-export --type dashboard --has-reference '{"type":"tag","id":"<tag-id>"}' \
+  --exclude-export-details | jq -c '.[] | select(.type=="dashboard") | {id, title: .attributes.title}'
+```
+
+Use `--type lens` (or `visualization`) to search visualizations.
+
+**Get:**
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
+  | jq '.[] | select(.type=="dashboard") | {id, title: .attributes.title,
+    panels: (.attributes.panelsJSON | fromjson | map({panelIndex, type, gridData})), references}'
+```
+
+**Create** an empty dashboard (omit `timeFrom`/`timeTo` and set `timeRestore:false` for no default time range):
+
+```bash
+jq -nc --arg id '<dash-id>' --arg title '<title>' '{type:"dashboard", id:$id, attributes:{title:$title, description:"",
+  panelsJSON:"[]", optionsJSON:({useMargins:true, syncColors:true, syncTooltips:true, syncCursor:true}|tojson),
+  timeRestore:true, timeFrom:"now-7d", timeTo:"now", kibanaSavedObjectMeta:{searchSourceJSON:"{}"}}, references:[]}' > dash.ndjson
+elastic kb saved-objects post-saved-objects-import --file dash.ndjson
+```
+
+**Edit** — export, apply a `jq` filter, re-import:
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
+  | jq -c '.[] | select(.type=="dashboard") | <filter>' > dash.ndjson
+elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
+```
+
+`<filter>` per change:
+
+```jq
+# Title, description
+.attributes.title = "<title>" | .attributes.description = "<text>"
+
+# Default time range
+.attributes.timeRestore = true | .attributes.timeFrom = "now-24h" | .attributes.timeTo = "now"
+
+# Replace tags
+.references = [.references[] | select(.type != "tag")] + (["<tag-id>"] | map({type:"tag", id:., name:"tag-ref-\(.)"}))
+
+# Move / resize panels (keys are panelIndex values)
+({"<panel-id>":{"x":0,"y":0,"w":24,"h":15}}) as $g | .attributes.panelsJSON = (.attributes.panelsJSON | fromjson
+  | map(if $g[.panelIndex] then .gridData += $g[.panelIndex] else . end) | tojson)
+```
+
+**Add a library panel** (`lens`, `visualization`, `links`, `search`, or `map` by reference). `$g` overrides any of `x`,
+`y`, `w`, `h`; `y` defaults to below the lowest top-level panel. `<panel-id>` must be unique in the dashboard.
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
+  | jq -c --arg t '<lens|visualization|links|search|map>' --arg ref '<object-id>' --arg p '<panel-id>' \
+    --argjson g '{"w":24,"h":15}' '.[] | select(.type=="dashboard") | (.attributes.panelsJSON | fromjson) as $P
+    | ({x:0, w:24, h:15, y:([$P[] | select(.gridData.sectionId == null) | .gridData | .y + .h] | max // 0)} + $g + {i:$p}) as $G
+    | .attributes.panelsJSON = ($P + [{type:$t, panelIndex:$p, gridData:$G, embeddableConfig:{}}] | tojson)
+    | .references += [{type:$t, id:$ref, name:"\($p):savedObjectRef"}]' > dash.ndjson
+elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
+```
+
+**Remove a panel** (and its references, including pre-7.13 `panelRefName` ones):
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' --exclude-export-details \
+  | jq -c --arg p '<panel-id>' '.[] | select(.type=="dashboard") | (.attributes.panelsJSON | fromjson) as $P
+    | ([$P[] | select(.panelIndex == $p) | .panelRefName // empty]) as $legacy
+    | .attributes.panelsJSON = ($P | map(select(.panelIndex != $p)) | tojson)
+    | .references |= map(select((.name | startswith("\($p):")) or (.name | IN($legacy[])) | not))' > dash.ndjson
+elastic kb saved-objects post-saved-objects-import --file dash.ndjson --overwrite
+```
+
+**Copy** a dashboard with everything it references to another cluster or space:
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"dashboard","id":"<dash-id>"}]' \
+  --include-references-deep --exclude-export-details | jq -c '.[] | select(.type)' > bundle.ndjson
+elastic --use-context '<target-context>' kb saved-objects post-saved-objects-import --file bundle.ndjson --overwrite
+```
+
+**Duplicate a visualization** under a new id:
+
+```bash
+elastic kb saved-objects post-saved-objects-export --objects '[{"type":"lens","id":"<vis-id>"}]' --exclude-export-details \
+  | jq -c --arg id '<new-id>' --arg title '<new-title>' '.[] | select(.type=="lens") | .id = $id | .attributes.title = $title' > vis.ndjson
+elastic kb saved-objects post-saved-objects-import --file vis.ndjson
+```
+
+**Delete** (stack only):
+
+```bash
+elastic kb saved-objects delete-saved-objects-type-id --type dashboard --id '<dash-id>' --yes
 ```
 
 ## Dashboard grid
@@ -241,8 +351,11 @@ Example JSON definitions live under [assets/](assets/): `dashboard-basic.json`, 
 
 | Error                                      | Likely cause                         | Fix                                                                          |
 | ------------------------------------------ | ------------------------------------ | ---------------------------------------------------------------------------- |
-| `dashboards` / `visualizations` missing    | Kibana < 9.5 detected                | See [Version gate](#version-gate-kibana--95)                                 |
-| Tag filter returns nothing                 | CLI array encoding                   | Use `--input-file` with a string value and `--no-validate`                   |
+| `dashboards` / `visualizations` missing    | Kibana < 9.5 detected                | Use the [Saved objects route](#saved-objects-route)                          |
+| Panels missing after `upsert-dashboard`    | API dropped unsupported panels       | Restore from a saved-objects export; edit via saved objects                  |
+| Import reports a conflict                  | Id exists, no `--overwrite`          | Pick a new id, or export, edit, and import with `--overwrite`                |
+| `jq: error ... fromjson`                   | Export returned no object            | Check the id, type, and the context's space                                  |
+| API tag filter returns nothing             | CLI array encoding                   | Use `--input-file` with a string value and `--no-validate`                   |
 | `must be array` validation error           | String value in `--input-file`       | Add `--no-validate`                                                          |
 | `Pass --yes to confirm`                    | Delete without confirmation          | Add `--yes`                                                                  |
 | 404 on GET after PUT                       | Wrong id or space                    | Confirm id and retry `GET kbn:/api/dashboards/{id}`                          |
@@ -269,8 +382,9 @@ with `--use-context <name>`.
 | `POST kbn:/api/visualizations`        | `elastic kb visualizations create-visualization --input-file '<path.json>'`                               | 9.5+\* |
 | `PUT kbn:/api/visualizations/{id}`    | `elastic kb visualizations upsert-visualization --id '<id>' --input-file '<path.json>'`                   | 9.5+\* |
 | `DELETE kbn:/api/visualizations/{id}` | `elastic kb visualizations delete-visualization --id '<id>' --yes`                                        | 9.5+\* |
-| `GET kbn:/api/saved_objects/_find`    | `elastic kb saved-objects get-saved-objects-find --input-file '<path.json>' --no-validate`                | stack  |
-| `POST kbn:/api/saved_objects/_export` | `elastic kb saved-objects post-saved-objects-export --objects '[{"type":"<type>","id":"<id>"}]'`          | all    |
+| `POST kbn:/api/saved_objects/_export` | `elastic kb saved-objects post-saved-objects-export --objects '[{"type":"<type>","id":"<id>"}]' --exclude-export-details` | all |
+| `POST kbn:/api/saved_objects/_export` | `elastic kb saved-objects post-saved-objects-export --type '<type>' [--search '<q>'] [--has-reference '<json>'] --exclude-export-details` | all |
 | `POST kbn:/api/saved_objects/_import` | `elastic kb saved-objects post-saved-objects-import --file '<path.ndjson>' --overwrite`                   | all    |
+| `DELETE kbn:/api/saved_objects/{type}/{id}` | `elastic kb saved-objects delete-saved-objects-type-id --type '<type>' --id '<id>' --yes`     | stack  |
 
-\* Works on 9.4 with the [version pin](#version-gate-kibana--95).
+\* On older versions use the [Saved objects route](#saved-objects-route).
